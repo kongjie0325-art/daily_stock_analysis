@@ -15,6 +15,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from inspect import getattr_static
 from typing import Optional, Dict, Any, List
 
 import pandas as pd
@@ -24,6 +25,11 @@ from src.report_language import normalize_report_language
 from src.search_service import SearchService
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
+from src.llm.backend_registry import (
+    resolve_generation_backend_id,
+    resolve_generation_fallback_backend_id,
+)
+from src.llm.generation_backend import GenerationError
 from src.schemas.market_light import MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 from src.services.intelligence_service import IntelligenceService
@@ -95,6 +101,8 @@ class MarketOverview:
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
+    top_concepts: List[Dict] = field(default_factory=list)    # 涨幅前5概念
+    bottom_concepts: List[Dict] = field(default_factory=list) # 跌幅前5概念
 
 
 @dataclass
@@ -345,6 +353,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
+            self._get_concept_rankings(overview)
         
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
@@ -448,6 +457,29 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         except Exception as e:
             logger.error("[大盘] %s action=get_sector_rankings status=failed error=%s", self._log_context(), e)
+
+    def _get_concept_rankings(self, overview: MarketOverview):
+        """获取概念/题材涨跌榜（fail-open）。"""
+        try:
+            logger.info("[大盘] %s action=get_concept_rankings status=start", self._log_context())
+
+            top_concepts, bottom_concepts = self.data_manager.get_concept_rankings(5)
+
+            if top_concepts or bottom_concepts:
+                overview.top_concepts = top_concepts
+                overview.bottom_concepts = bottom_concepts
+
+                logger.info(
+                    "[大盘] %s action=get_concept_rankings status=success top=%s bottom=%s",
+                    self._log_context(),
+                    [s.get('name') for s in overview.top_concepts],
+                    [s.get('name') for s in overview.bottom_concepts],
+                )
+            else:
+                logger.warning("[大盘] %s action=get_concept_rankings status=empty", self._log_context())
+
+        except Exception as e:
+            logger.warning("[大盘] %s action=get_concept_rankings status=failed error=%s", self._log_context(), e)
     
     # def _get_north_flow(self, overview: MarketOverview):
     #     """获取北向资金流入"""
@@ -537,6 +569,24 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         Returns:
             大盘复盘报告文本
         """
+        backend_error = self._get_analyzer_generation_backend_config_error()
+        if backend_error is not None:
+            logger.error(
+                "[大盘] %s action=generate_review status=failed error_type=%s error=%s",
+                self._log_context(),
+                type(backend_error).__name__,
+                backend_error,
+            )
+            record_llm_run(
+                success=False,
+                provider="litellm",
+                model=getattr(self.config, "litellm_model", None),
+                call_type="market_review",
+                error_type=type(backend_error).__name__,
+                error_message=backend_error,
+            )
+            raise backend_error
+
         if not self.analyzer or not self.analyzer.is_available():
             logger.warning(
                 "[大盘] %s action=generate_review status=fallback_template reason=no_analyzer",
@@ -594,6 +644,24 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         )
         return self._generate_template_review(overview, news)
 
+    def _get_analyzer_generation_backend_config_error(self) -> Optional[GenerationError]:
+        """Return analyzer backend config errors without relying on dynamic mock attributes."""
+        if self.analyzer is None:
+            try:
+                resolve_generation_backend_id(self.config)
+                resolve_generation_fallback_backend_id(self.config)
+            except GenerationError as exc:
+                return exc
+            return None
+        missing = object()
+        if getattr_static(self.analyzer, "get_generation_backend_config_error", missing) is missing:
+            return None
+        method = getattr(self.analyzer, "get_generation_backend_config_error", None)
+        if not callable(method):
+            return None
+        error = method()
+        return error if isinstance(error, GenerationError) else None
+
     def build_market_review_payload(
         self,
         overview: MarketOverview,
@@ -639,6 +707,10 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             "sectors": {
                 "top": list(overview.top_sectors or []),
                 "bottom": list(overview.bottom_sectors or []),
+            },
+            "concepts": {
+                "top": list(overview.top_concepts or []),
+                "bottom": list(overview.bottom_concepts or []),
             },
             "news": [self._normalize_news_item(item) for item in (news or [])[:8]],
             "sections": sections,
@@ -934,46 +1006,42 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         return "\n".join(lines)
 
     def _build_sector_block(self, overview: MarketOverview) -> str:
-        """Build sector ranking block."""
-        if not overview.top_sectors and not overview.bottom_sectors:
+        """Build industry and concept ranking blocks."""
+        if (
+            not overview.top_sectors
+            and not overview.bottom_sectors
+            and not overview.top_concepts
+            and not overview.bottom_concepts
+        ):
             return ""
         lines = []
-        if overview.top_sectors:
-            if self._get_review_language() == "en":
-                lines.extend([
-                    "#### Leading Sectors",
-                    "| Rank | Sector | Change |",
-                    "|------|--------|--------|",
-                ])
-            else:
-                lines.extend([
-                    "#### 领涨板块 Top 5",
-                    "| 排名 | 板块 | 涨跌幅 |",
-                    "|------|------|--------|",
-                ])
-            for rank, sector in enumerate(overview.top_sectors[:5], 1):
-                lines.append(
-                    f"| {rank} | {sector.get('name', '-')} | {self._format_signed_pct(sector.get('change_pct'))} |"
-                )
-        if overview.bottom_sectors:
+        language = self._get_review_language()
+
+        def append_ranking(title: str, name_label: str, rows: List[Dict]) -> None:
+            if not rows:
+                return
             if lines:
                 lines.append("")
-            if self._get_review_language() == "en":
-                lines.extend([
-                    "#### Lagging Sectors",
-                    "| Rank | Sector | Change |",
-                    "|------|--------|--------|",
-                ])
-            else:
-                lines.extend([
-                    "#### 领跌板块 Top 5",
-                    "| 排名 | 板块 | 涨跌幅 |",
-                    "|------|------|--------|",
-                ])
-            for rank, sector in enumerate(overview.bottom_sectors[:5], 1):
+            lines.extend([
+                title,
+                f"| {'Rank' if language == 'en' else '排名'} | {name_label} | {'Change' if language == 'en' else '涨跌幅'} |",
+                "|------|------|--------|",
+            ])
+            for rank, item in enumerate(rows[:5], 1):
                 lines.append(
-                    f"| {rank} | {sector.get('name', '-')} | {self._format_signed_pct(sector.get('change_pct'))} |"
+                    f"| {rank} | {item.get('name', '-')} | {self._format_signed_pct(item.get('change_pct'))} |"
                 )
+
+        if language == "en":
+            append_ranking("#### Leading Industry Sectors", "Sector", overview.top_sectors)
+            append_ranking("#### Lagging Industry Sectors", "Sector", overview.bottom_sectors)
+            append_ranking("#### Leading Concept Themes", "Concept", overview.top_concepts)
+            append_ranking("#### Lagging Concept Themes", "Concept", overview.bottom_concepts)
+        else:
+            append_ranking("#### 行业板块领涨 Top 5", "行业板块", overview.top_sectors)
+            append_ranking("#### 行业板块领跌 Top 5", "行业板块", overview.bottom_sectors)
+            append_ranking("#### 概念板块领涨 Top 5", "概念板块", overview.top_concepts)
+            append_ranking("#### 概念板块领跌 Top 5", "概念板块", overview.bottom_concepts)
         return "\n".join(lines)
 
     def _build_news_block(self, news: List) -> str:
@@ -1043,6 +1111,18 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         except (TypeError, ValueError):
             return "N/A"
         return f"{numeric_value:+.2f}%"
+
+    @classmethod
+    def _format_ranking_summary(cls, rows: List[Dict], limit: int = 3) -> str:
+        parts = []
+        for item in (rows or [])[:limit]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            parts.append(f"{name}({cls._format_signed_pct(item.get('change_pct'))})")
+        return ", ".join(parts)
 
     @staticmethod
     def _escape_markdown_link_label(value: str) -> str:
@@ -1136,8 +1216,10 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
         
         # 板块信息
-        top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:3]])
-        bottom_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.bottom_sectors[:3]])
+        top_sectors_text = self._format_ranking_summary(overview.top_sectors)
+        bottom_sectors_text = self._format_ranking_summary(overview.bottom_sectors)
+        top_concepts_text = self._format_ranking_summary(overview.top_concepts)
+        bottom_concepts_text = self._format_ranking_summary(overview.bottom_concepts)
         
         # 新闻信息 - 支持 SearchResult 对象或字典
         news_text = ""
@@ -1166,11 +1248,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 stats_block = "## Market Breadth\n(No equivalent advance/decline statistics are available for this market.)"
 
             if self.profile.has_sector_rankings:
-                sector_block = f"""## Sector Performance
-Leading: {top_sectors_text if top_sectors_text else "N/A"}
-Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
+                sector_block = f"""## Sector / Theme Performance
+Industry leading: {top_sectors_text if top_sectors_text else "N/A"}
+Industry lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}
+Concept leading: {top_concepts_text if top_concepts_text else "N/A"}
+Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             else:
-                sector_block = "## Sector Performance\n(Sector data not available for this market.)"
+                sector_block = "## Sector / Theme Performance\n(Sector/theme data not available for this market.)"
         else:
             if self.profile.has_market_stats:
                 stats_block = f"""## 市场概况
@@ -1182,8 +1266,10 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 
             if self.profile.has_sector_rankings:
                 sector_block = f"""## 板块表现
-领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
-领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}"""
+行业领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
+行业领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}
+概念领涨: {top_concepts_text if top_concepts_text else "暂无数据"}
+概念领跌: {bottom_concepts_text if bottom_concepts_text else "暂无数据"}"""
             else:
                 sector_block = "## 板块表现\n（该市场暂无板块涨跌数据）"
 
@@ -1252,7 +1338,7 @@ Lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}"""
 (Interpret what turnover, participation, and flow signals imply.)
 
 ### 4. Sector Highlights
-(Analyze the drivers behind the leading and lagging sectors or themes.)
+(Distinguish industry-sector moves from concept/theme moves, then analyze drivers and persistence.)
 
 ### 5. Outlook
 (Provide the near-term outlook based on price action and news.)
@@ -1315,7 +1401,7 @@ Output the report content directly, no extra commentary.
 （{self._get_index_hint()}，说明谁在护盘、谁在拖累，以及关键支撑/压力）
 
 ### 三、板块主线
-（分析领涨/领跌板块背后的逻辑、持续性和是否形成主线）
+（区分行业板块与概念题材，分析领涨/领跌背后的逻辑、持续性和是否形成主线）
 
 ### 四、资金与情绪
 （解读成交额、涨跌停结构、市场宽度和风险偏好）
@@ -1371,6 +1457,8 @@ Output the report content directly, no extra commentary.
         separator = ", " if template_language == "en" else "、"
         top_text = separator.join([s['name'] for s in overview.top_sectors[:3]])
         bottom_text = separator.join([s['name'] for s in overview.bottom_sectors[:3]])
+        top_concept_text = separator.join([s['name'] for s in overview.top_concepts[:3]])
+        bottom_concept_text = separator.join([s['name'] for s in overview.bottom_concepts[:3]])
 
         if template_language == "en":
             stats_section = ""
@@ -1386,11 +1474,13 @@ Output the report content directly, no extra commentary.
 | Turnover ({self._get_turnover_unit_label()}) | {overview.total_amount:.0f} |
 """
             sector_section = ""
-            if self.profile.has_sector_rankings and (top_text or bottom_text):
+            if self.profile.has_sector_rankings and (top_text or bottom_text or top_concept_text or bottom_concept_text):
                 sector_section = f"""
-### 4. Sector Highlights
-- **Leaders**: {top_text or "N/A"}
-- **Laggards**: {bottom_text or "N/A"}
+### 4. Sector / Theme Highlights
+- **Industry Leaders**: {top_text or "N/A"}
+- **Industry Laggards**: {bottom_text or "N/A"}
+- **Concept Leaders**: {top_concept_text or "N/A"}
+- **Concept Laggards**: {bottom_concept_text or "N/A"}
 """
             market_names = {"us": "US Market Recap", "hk": "HK Market Recap"}
             market_name = market_names.get(self.region, "A-share Market Recap")
